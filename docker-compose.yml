@@ -1,0 +1,164 @@
+name: fullstack-observability
+
+# ---------------------------------------------------------------------------
+# Full-Stack Observability & Security Monitoring
+#   Lane 1 (Metrics):  Prometheus + Node-exporter + cAdvisor
+#   Lane 2 (Logs):     Vector -> Loki -> Grafana
+#   Lane 3 (Security):  Trivy Host Scanner + Trivy Watcher (custom Python svc)
+# ---------------------------------------------------------------------------
+
+networks:
+  observability:
+    name: observability-net
+    driver: bridge
+
+volumes:
+  prometheus_data:
+  loki_data:
+  grafana_data:
+  node_exporter_textfile:      # shared between trivy-host-scanner (writer) and node-exporter (reader)
+  trivy_cache:                 # shared trivy vulnerability DB cache between host-scanner and watcher
+
+services:
+
+  # -------------------------------------------------------------------------
+  # LANE 1: METRICS
+  # -------------------------------------------------------------------------
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    ports:
+      - "9090:9090"
+    networks:
+      - observability
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: node-exporter
+    restart: unless-stopped
+    pid: host
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+      - node_exporter_textfile:/textfile_collector:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+      - "--collector.textfile.directory=/textfile_collector"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+    ports:
+      - "9100:9100"
+    networks:
+      - observability
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    restart: unless-stopped
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk:/dev/disk:ro
+    ports:
+      - "8085:8080"
+    networks:
+      - observability
+
+  # -------------------------------------------------------------------------
+  # LANE 2: LOGS
+  # -------------------------------------------------------------------------
+
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: loki
+    restart: unless-stopped
+    volumes:
+      - ./config/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki_data:/loki
+    command: "-config.file=/etc/loki/loki-config.yml"
+    ports:
+      - "3100:3100"
+    networks:
+      - observability
+
+  vector:
+    image: timberio/vector:0.41.1-alpine
+    container_name: vector
+    restart: unless-stopped
+    volumes:
+      - ./config/vector/vector.toml:/etc/vector/vector.toml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["--config", "/etc/vector/vector.toml"]
+    depends_on:
+      - loki
+    networks:
+      - observability
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      # NOTE: provisioning files below are convenience/optional. The task
+      # requires manually wiring the datasources through the Grafana UI too
+      # (see README "Step 5: Wire up Data Sources") -- both paths are supported.
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "9000:3000"
+    depends_on:
+      - prometheus
+      - loki
+    networks:
+      - observability
+
+  # -------------------------------------------------------------------------
+  # LANE 3: SECURITY
+  # -------------------------------------------------------------------------
+
+  trivy-host-scanner:
+    build:
+      context: ./trivy-host-scanner
+    container_name: trivy-host-scanner
+    restart: unless-stopped
+    environment:
+      - SCAN_INTERVAL_SECONDS=21600   # 6 hours
+    volumes:
+      - /:/host:ro
+      - node_exporter_textfile:/output
+      - trivy_cache:/root/.cache
+    networks:
+      - observability
+
+  trivy-watcher:
+    build:
+      context: ./trivy-watcher
+    container_name: trivy-watcher
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - trivy_cache:/root/.cache
+    ports:
+      - "8090:8090"   # JSON API
+      - "8086:8086"   # Prometheus metrics
+    networks:
+      - observability

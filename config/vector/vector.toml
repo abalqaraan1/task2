@@ -1,0 +1,66 @@
+# -----------------------------------------------------------------------------
+# Vector configuration: tail the Docker socket, ship every *application*
+# container's logs to Loki as JSON, but exclude the monitoring stack itself
+# so it doesn't ingest (and re-emit) its own logs -> infinite loop.
+# -----------------------------------------------------------------------------
+
+data_dir = "/var/lib/vector"
+
+# ---- SOURCE ------------------------------------------------------------------
+[sources.docker_logs]
+type              = "docker_logs"
+docker_host       = "unix:///var/run/docker.sock"
+include_containers = []           # empty = all containers ...
+exclude_containers = [             # ... except the observability stack itself
+  "vector",
+  "loki",
+  "grafana",
+  "prometheus",
+  "node-exporter",
+  "cadvisor",
+  "trivy-host-scanner",
+  "trivy-watcher",
+]
+multiline.start_pattern = "^\\S"
+multiline.mode           = "halt_before"
+multiline.condition_pattern = "^\\S"
+multiline.timeout_ms     = 1000
+
+# ---- TRANSFORM -----------------------------------------------------------
+# Normalize the event: ensure a real timestamp, and pull out clean labels
+# (container name / image / stream) for Loki without dumping everything
+# into the label set (which would blow up cardinality).
+[transforms.parse_and_label]
+type   = "remap"
+inputs = ["docker_logs"]
+source = '''
+  # Docker already gives us a parsed RFC3339Nano `.timestamp` field; make sure
+  # it's a proper `timestamp` type so Loki gets accurate ingest ordering.
+  if exists(.timestamp) {
+    ts, err = to_timestamp(.timestamp)
+    if err == null {
+      .timestamp = ts
+    }
+  } else {
+    .timestamp = now()
+  }
+
+  .container_name = del(.container_name) ?? "unknown"
+  .image          = del(.image) ?? "unknown"
+  .stream         = del(.stream) ?? "stdout"
+  .host           = get_hostname!()
+'''
+
+# ---- SINK ------------------------------------------------------------------
+[sinks.loki]
+type     = "loki"
+inputs   = ["parse_and_label"]
+endpoint = "http://loki:3100"
+encoding.codec = "json"
+out_of_order_action = "accept"
+
+[sinks.loki.labels]
+container = "{{ container_name }}"
+image     = "{{ image }}"
+stream    = "{{ stream }}"
+job       = "vector"
